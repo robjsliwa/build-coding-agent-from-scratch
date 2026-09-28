@@ -1,0 +1,659 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+)
+
+const (
+	ollamaURL = "http://localhost:11434/api/chat"
+	// model     = "qwen3.6:27b-mlx"
+	model = "gemma4:e4b-mlx"
+)
+
+const (
+	numCtx    = 128 * 1024
+	compactAt = numCtx * 8 / 10
+)
+
+type Message struct {
+	Role      string     `json:"role"`
+	Content   string     `json:"content"`
+	Thinking  string     `json:"thinking,omitempty"`
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	ToolName  string     `json:"tool_name,omitempty"`
+}
+
+type ToolCall struct {
+	Function ToolCallFunction `json:"function"`
+}
+
+type ToolCallFunction struct {
+	Name      string         `json:"name"`
+	Arguments map[string]any `json:"arguments"`
+}
+
+type Tool struct {
+	Type     string       `json:"type"`
+	Function ToolFunction `json:"function"`
+}
+
+type ToolFunction struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Parameters  json.RawMessage `json:"parameters"`
+}
+
+type chatRequest struct {
+	Model    string         `json:"model"`
+	Messages []Message      `json:"messages"`
+	Stream   bool           `json:"stream"`
+	Tools    []Tool         `json:"tools,omitempty"`
+	Options  map[string]any `json:"options,omitempty"`
+}
+
+type chatResponse struct {
+	Message         Message `json:"message"`
+	PromptEvalCount int     `json:"prompt_eval_count"`
+	EvalCount       int     `json:"eval_count"`
+	Done            bool    `json:"done"`
+}
+
+type ToolDef struct {
+	Tool Tool
+	Safe bool
+	Run  func(args map[string]any) string
+}
+
+// A Command is the harness-side twin of a ToolDef: the user invokes it,
+// never the model, and it runs before the conversation array is touched.
+type Command struct {
+	Name, Desc string
+	Run        func(arg string)
+}
+
+var approved = map[string]bool{}
+
+func askPermission(scanner *bufio.Scanner, name string) bool {
+	fmt.Printf("   allow %s? [y]ess once / [a]lways / [n]o: ", name)
+	if !scanner.Scan() {
+		return false
+	}
+
+	switch strings.ToLower(strings.TrimSpace(scanner.Text())) {
+	case "y":
+		return true
+
+	case "a":
+		approved[name] = true
+		return true
+	}
+
+	return false
+}
+
+var registry = []ToolDef{readFileDef, listFilesDef, bashDef, editFileDef}
+
+var readFileDef = ToolDef{
+	Tool: Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name: "read_file",
+			Description: "Read a file and return its contents as text. " +
+				"Use this whenever you need to see what a file contains.",
+			Parameters: json.RawMessage(`{
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Relative path to the file"}
+            },
+            "required": ["path"]
+        }`),
+		},
+	},
+	Safe: true,
+	Run:  readFile,
+}
+
+func readFile(args map[string]any) string {
+	path, ok := args["path"].(string)
+	if !ok {
+		return "error: read_file requires a string 'path' argument"
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "error: " + err.Error()
+	}
+
+	return string(data)
+}
+
+var listFilesDef = ToolDef{
+	Tool: Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name: "list_files",
+			Description: "Recursively list files under a directory. " +
+				"Use this to discover what exists before reading files.",
+			Parameters: json.RawMessage(`{
+				"type": "object",
+				"properties": {
+					"path": {"type": "string", "description": "Directory to list; defaults to the current directory"}
+				}
+			}`),
+		},
+	},
+	Safe: true,
+	Run:  listFiles,
+}
+
+func listFiles(args map[string]any) string {
+	dir, _ := args["path"].(string)
+	if dir == "" {
+		dir = "."
+	}
+	var b strings.Builder
+	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() && d.Name() == ".git" {
+			return filepath.SkipDir
+		}
+		if !d.IsDir() {
+			b.WriteString(p + "\n")
+		}
+		return nil
+	})
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	return b.String()
+}
+
+var bashDef = ToolDef{
+	Tool: Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name: "bash",
+			Description: "Execute a shell command and return its combined stdout and stderr. " +
+				"Use for running tests, builds, git, and anything without a dedicated tool.",
+			Parameters: json.RawMessage(`{
+				"type": "object",
+				"properties": {
+					"command": {"type": "string", "description": "The shell command to run"}
+				},
+				"required": ["command"]
+			}`),
+		},
+	},
+	Run: bashTool,
+}
+
+func bashTool(args map[string]any) string {
+	command, ok := args["command"].(string)
+	if !ok {
+		return "error: bash requires a string 'command' argument"
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, "bash", "-c", command).CombinedOutput()
+	if err != nil {
+		return string(out) + "\nerror: " + err.Error()
+	}
+	if len(out) == 0 {
+		return "(no output)"
+	}
+	return string(out)
+}
+
+var editFileDef = ToolDef{
+	Tool: Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name: "edit_file",
+			Description: "Edit a file by replacing old_string (which must occur exactly once) " +
+				"with new_string. If old_string is empty and the file does not exist, " +
+				"the file is created with new_string as its contents.",
+			Parameters: json.RawMessage(`{
+				"type": "object",
+				"properties": {
+					"path": {"type": "string", "description": "Relative path to the file"},
+					"old_string": {"type": "string", "description": "The exact text to replace. Must match exactly once, including whitespace and indentation. Empty to create a new file."},
+					"new_string": {"type": "string", "description": "The replacement text"}
+				},
+				"required": ["path", "new_string"]
+			}`),
+		},
+	},
+	Run: editFile,
+}
+
+func editFile(args map[string]any) string {
+	path, ok := args["path"].(string)
+	if !ok {
+		return "error: edit_file requires a string 'path' argument"
+	}
+
+	oldStr, _ := args["old_string"].(string)
+	newStr, ok := args["new_string"].(string)
+	if !ok {
+		return "error: edit_file requires a string 'new_string' argument"
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) && oldStr == "" {
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				return "error: " + err.Error()
+			}
+			if err := os.WriteFile(path, []byte(newStr), 0o644); err != nil {
+				return "error: " + err.Error()
+			}
+			return "ok, created " + path
+		}
+		return "error: " + err.Error()
+	}
+
+	content := string(data)
+	switch n := strings.Count(content, oldStr); {
+	case oldStr == "" || n == 0:
+		return "error: old_string not found in " + path +
+			" - re-read the file; it may have changed"
+
+	case n > 1:
+		return fmt.Sprintf("error: old_string appears %d times in %s - "+
+			"include more surrounding context to make it unique", n, path)
+	}
+
+	content = strings.Replace(content, oldStr, newStr, 1)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return "error: " + err.Error()
+	}
+
+	return "ok, edited " + path
+}
+
+func systemPrompt() string {
+	cwd, _ := os.Getwd()
+	return fmt.Sprintf(`You are loom, a coding agent. You complete tasks by calling tools,
+not by describing what could be done.
+
+Environment:
+- Working directory: %s
+- Platform: %s/%s
+- Today's date: %s
+
+Rules:
+- Before editing a file, read it first. Quote old_string exactly, including whitespace.
+- After any code change, verify it: build or run tests with bash. Never claim a success you have not seen.
+- If a tool returns an error, read it and change your approach; never repeat the same call unchanged.
+- Prefer small, targeted edits over rewriting whole files.
+- When done, summarize what you changed and how you verified it, in a sentence or two.`,
+		cwd, runtime.GOOS, runtime.GOARCH, time.Now().Format("2006-01-02"))
+}
+
+func chat(ctx context.Context, messages []Message) (Message, int, error) {
+	var used int
+	chatReq := chatRequest{
+		Model:    model,
+		Messages: messages,
+		Stream:   true,
+		Tools: func() []Tool {
+			tools := make([]Tool, len(registry))
+			for i, def := range registry {
+				tools[i] = def.Tool
+			}
+			return tools
+		}(),
+		Options: map[string]any{"num_ctx": numCtx},
+	}
+	body, err := json.Marshal(chatReq)
+	if err != nil {
+		return Message{}, used, err
+	}
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		"POST",
+		ollamaURL,
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return Message{}, used, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return Message{}, used, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return Message{}, used, fmt.Errorf("request failed with status: %s", resp.Status)
+	}
+
+	dec := json.NewDecoder(resp.Body)
+	var (
+		assembled = Message{Role: "assistant"}
+		content   strings.Builder
+		prefixed  bool
+	)
+
+	for {
+		var chunk chatResponse
+		if err := dec.Decode(&chunk); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			assembled.Content = content.String()
+			return assembled, used, err // partial result travels with the error
+		}
+
+		if chunk.Message.Thinking != "" {
+			// \033[90m sets the text color to grey
+			// \033[0m resets it back to default
+			fmt.Printf("\033[90m%s\033[0m", chunk.Message.Thinking)
+		}
+
+		if chunk.Message.Content != "" {
+			if !prefixed {
+				fmt.Print("\nloom: ")
+				prefixed = true
+			}
+			fmt.Print(chunk.Message.Content)
+			content.WriteString(chunk.Message.Content)
+		}
+		assembled.ToolCalls = append(assembled.ToolCalls, chunk.Message.ToolCalls...)
+		if chunk.Done {
+			used = chunk.PromptEvalCount + chunk.EvalCount
+			break
+		}
+	}
+
+	assembled.Content = content.String()
+	return assembled, used, nil
+}
+
+func summarize(ctx context.Context, messages []Message) (string, error) {
+	instruction := Message{Role: "user", Content: "Summarize this conversation " +
+		"for your own future reference. Preserve: the user's goals, decisions made, " +
+		"file paths touched and how they changed, tool results that still matter, " +
+		"and unfinished work. Dense bullet points. Omit pleasantries and dead ends."}
+
+	msgs := append(append([]Message{}, messages[1:]...), instruction)
+
+	body, err := json.Marshal(chatRequest{
+		Model:    model,
+		Messages: msgs,
+		Stream:   false,
+		Options:  map[string]any{"num_ctx": numCtx},
+	})
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		"POST",
+		ollamaURL,
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("summarize failed with status: %s", resp.Status)
+	}
+
+	var res chatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return "", err
+	}
+
+	return res.Message.Content, nil
+}
+
+func compact(conversation []Message, summary string) []Message {
+	const keep = 6
+	start := len(conversation) - keep
+
+	if start < 1 {
+		start = 1
+	}
+
+	for start > 1 && conversation[start].Role == "tool" {
+		start--
+	}
+
+	fresh := []Message{
+		{Role: "system", Content: systemPrompt()},
+		{Role: "user", Content: "[Context summary - earlier messages were compacted " +
+			"to save space. File contents mentioned below may be stale, re-read " +
+			"files before editing.]\n\n" + summary},
+	}
+
+	return append(fresh, conversation[start:]...)
+}
+
+func estimateTokens(messages []Message) int {
+	n := 0
+	for _, m := range messages {
+		n += messageTokens(m)
+	}
+
+	return n
+}
+
+func messageTokens(m Message) int {
+	n := len(m.Content) + len(m.Thinking)
+	for _, tc := range m.ToolCalls {
+		b, _ := json.Marshal(tc)
+		n += len(b)
+	}
+
+	return n / 4
+}
+
+func roleField(m Message) string {
+	switch {
+	case m.Role == "assistant" && len(m.ToolCalls) > 0:
+		names := make([]string, len(m.ToolCalls))
+		for i, tc := range m.ToolCalls {
+			names[i] = tc.Function.Name
+		}
+		return "assistant  ⚙ " + strings.Join(names, ", ")
+
+	case m.Role == "tool":
+		return "tool ⇐ " + m.ToolName
+	}
+
+	return m.Role
+}
+
+func preview(m Message, n int) string {
+	if m.Content == "" && len(m.ToolCalls) > 0 {
+		return fmt.Sprintf("(%d tool call(s), no text)", len(m.ToolCalls))
+	}
+
+	text := strings.ReplaceAll(m.Content, "\n", "␤")
+	r := []rune(text)
+	if len(r) > n {
+		return string(r[:n]) + "…"
+	}
+
+	return text
+}
+
+// xray prints the conversation array, one row per message, then the
+// totals the compaction trigger works from. Since the model has no
+// state but this array, the printout is the model's whole mind.
+func xray(conversation []Message) {
+	fmt.Println("── conversation x-ray ──────────────────────────────────────────")
+	for i, m := range conversation {
+		fmt.Printf(" #%-3d%-28s%9s  %s\n",
+			i, roleField(m), fmt.Sprintf("~%d tok", messageTokens(m)), preview(m, 40))
+	}
+	fmt.Println("────────────────────────────────────────────────────────────────")
+	fmt.Printf(" %d messages · ~%d tokens estimated · budget %d · compacts at %d\n",
+		len(conversation), estimateTokens(conversation), numCtx, compactAt)
+}
+
+func main() {
+	fmt.Printf("loom v0.9 - chatting with %s (ctrl-c to quit)\n", model)
+	scanner := bufio.NewScanner(os.Stdin)
+	conversation := []Message{{Role: "system", Content: systemPrompt()}}
+	var ctxSize int
+
+	var commands []Command
+	commands = []Command{
+		{"/help", "list commands", func(string) {
+			for _, c := range commands {
+				fmt.Printf("  %-10s %s\n", c.Name, c.Desc)
+			}
+		}},
+		{"/clear", "start a fresh session", func(string) {
+			conversation = []Message{{Role: "system", Content: systemPrompt()}}
+			ctxSize = 0
+			fmt.Println("  session cleared")
+		}},
+		{"/compact", "compact the conversation now", func(string) {
+			before := estimateTokens(conversation)
+			summary, err := summarize(context.Background(), conversation)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "compaction failed, conversation untouched:", err)
+				return
+			}
+			conversation = compact(conversation, summary)
+			fmt.Printf("  compacted: ~%d → ~%d tokens\n", before, estimateTokens(conversation))
+		}},
+		{"/context", "x-ray the conversation array", func(string) {
+			xray(conversation)
+		}},
+	}
+
+	for {
+		fmt.Print("\n❯ ")
+		if !scanner.Scan() {
+			break
+		}
+
+		input := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(input, "/") {
+			name, arg, _ := strings.Cut(input, " ")
+			found := false
+			for _, c := range commands {
+				if c.Name == name {
+					c.Run(arg)
+					found = true
+					break
+				}
+			}
+			if !found {
+				fmt.Printf("  unknown command %q — try /help\n", name)
+			}
+			continue
+		}
+
+		conversation = append(
+			conversation,
+			Message{
+				Role:    "user",
+				Content: input,
+			},
+		)
+
+		for {
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+			reply, used, err := chat(ctx, conversation)
+			stop()
+			if err != nil {
+				if ctx.Err() != nil {
+					fmt.Println("\n(interrupted)")
+					if reply.Content != "" {
+						reply.ToolCalls = nil
+						conversation = append(conversation, reply)
+					}
+					break
+				}
+				fmt.Fprintln(os.Stderr, "error:", err)
+				break
+			}
+
+			conversation = append(conversation, reply)
+
+			for _, tc := range reply.ToolCalls {
+				fmt.Printf("  ⚙ %s(%v)\n", tc.Function.Name, tc.Function.Arguments)
+				var result string
+				var toolDef ToolDef
+				var toolFound bool
+				for _, def := range registry {
+					if def.Tool.Function.Name == tc.Function.Name {
+						toolDef = def
+						toolFound = true
+					}
+				}
+
+				switch {
+				case !toolFound:
+					result = "error: unknown tool " + tc.Function.Name
+
+				case toolDef.Safe || approved[tc.Function.Name] || askPermission(scanner, tc.Function.Name):
+					result = toolDef.Run(tc.Function.Arguments)
+
+				default:
+					result = "permission denied by user. Do not retry the same call; " +
+						"explain what you wanted to do, or try a different approach."
+				}
+
+				conversation = append(conversation, Message{
+					Role:     "tool",
+					ToolName: tc.Function.Name,
+					Content:  result,
+				})
+			}
+
+			ctxSize = max(estimateTokens(conversation), used)
+
+			if ctxSize > compactAt {
+				fmt.Printf("\n   [compacting %d messages, ctx %d/%d]\n",
+					len(conversation), ctxSize, numCtx)
+				summary, err := summarize(context.Background(), conversation)
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "compaction failed, continuing:", err)
+				} else {
+					conversation = compact(conversation, summary)
+					ctxSize = estimateTokens(conversation)
+				}
+			}
+
+			if len(reply.ToolCalls) == 0 {
+				break
+			}
+		}
+		fmt.Printf("\n  [ctx %d/%d]\n", ctxSize, numCtx)
+	}
+}
